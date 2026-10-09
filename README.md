@@ -94,3 +94,7 @@ An AI-powered email management agent that connects to Gmail, classifies incoming
 
 &#x20; Gmail Send       No Email Sent
 
+
+## Live Demo
+
+[Try AI Email Agent](https://email-ai-agent-eqmi8z5twq97kwglgfdi2g.streamlit.app)
