@@ -1,4 +1,6 @@
+
 import re
+from email.utils import parseaddr
 from typing import TypedDict
 
 from langgraph.graph import StateGraph, START, END
@@ -9,37 +11,45 @@ from agent.llm import llm
 from tools.email_tools import send_email
 
 
-class EmailAgentState(TypedDict):
+# =========================================================
+# STATE
+# =========================================================
+
+class EmailAgentState(TypedDict, total=False):
     email: str
+    sender: str
+    original_subject: str
+
     category: str
     response: str
+
     recipient: str
     subject: str
     draft_body: str
+
     review_status: str
     error_message: str
 
+
+# =========================================================
+# EMAIL CLASSIFICATION
+# =========================================================
 
 def triage_email(state: EmailAgentState):
     prompt = f"""
 You are an email triage assistant.
 
-Classify the following email into exactly ONE category.
-
-NEEDS_REPLY
-- The sender expects a response from the user.
-
-FYI
-- The email is informational and does not require a response.
-
-ACTION_NEEDED
-- The user needs to perform some action.
-
-Return ONLY one of:
+Classify the following email into exactly one category:
 
 NEEDS_REPLY
 FYI
 ACTION_NEEDED
+
+NEEDS_REPLY: Sender expects a response.
+FYI: Informational email; no response required.
+ACTION_NEEDED: User must perform an action.
+
+Return only the category name.
 
 Email:
 {state["email"]}
@@ -49,129 +59,164 @@ Email:
         result = llm.invoke(prompt)
         category = result.content.strip().upper()
 
-    except Exception as e:
-        print("\nGemini API error during triage:")
-        print(e)
+        if category not in {
+            "NEEDS_REPLY",
+            "FYI",
+            "ACTION_NEEDED",
+        }:
+            raise ValueError(
+                f"Invalid AI classification: {category}"
+            )
 
+        return {
+            "category": category,
+            "error_message": "",
+        }
+
+    except Exception as e:
         return {
             "category": "AI_ERROR",
             "error_message": str(e),
         }
 
-    if category not in [
-        "NEEDS_REPLY",
-        "FYI",
-        "ACTION_NEEDED",
-    ]:
-        return {
-            "category": "AI_ERROR",
-            "error_message": (
-                "Gemini returned an invalid classification: "
-                f"{category}"
-            ),
-        }
-
-    return {
-        "category": category,
-        "error_message": "",
-    }
-
 
 def route_email(state: EmailAgentState):
-    if state["category"] == "NEEDS_REPLY":
+    category = state.get("category")
+
+    if category == "NEEDS_REPLY":
         return "reply"
 
-    elif state["category"] == "ACTION_NEEDED":
+    if category == "ACTION_NEEDED":
         return "action"
 
-    elif state["category"] == "AI_ERROR":
+    if category == "AI_ERROR":
         return "error"
 
     return "fyi"
 
 
+# =========================================================
+# GENERATE REPLY
+# =========================================================
+
 def generate_reply(state: EmailAgentState):
-    email = state["email"]
+    sender = state.get("sender", "")
+    recipient = parseaddr(sender)[1]
 
-    match = re.search(
-        r"[\w\.-]+@[\w\.-]+\.\w+",
-        email
-    )
+    # Never guess the recipient from email body.
+    if (
+        not recipient
+        or "@" not in recipient
+        or "\n" in recipient
+        or "\r" in recipient
+    ):
+        return {
+            "category": "AI_ERROR",
+            "error_message": "Invalid sender email address.",
+            "response": (
+                "Reply recipient could not be identified."
+            ),
+        }
 
-    recipient = match.group(0) if match else ""
+    # -----------------------------------------------------
+    # SUBJECT EXTRACTION
+    # -----------------------------------------------------
 
-    subject_match = re.search(
-        r"SUBJECT:\s*(.*)",
-        email
-    )
-
+    # First preference: structured subject from Gmail/UI.
     original_subject = (
-        subject_match.group(1).strip()
-        if subject_match
-        else "Email"
+        state.get("original_subject") or ""
+    ).strip()
+
+    # Backward compatibility with existing tests:
+    # Extract SUBJECT: from email text when needed.
+    if not original_subject:
+        match = re.search(
+            r"^SUBJECT:\s*(.+)$",
+            state.get("email", ""),
+            flags=re.IGNORECASE | re.MULTILINE,
+        )
+
+        if match:
+            original_subject = match.group(1).strip()
+
+    if not original_subject:
+        original_subject = "Email"
+
+    # Avoid "Re: Re: ..." duplication.
+    reply_subject = (
+        original_subject
+        if original_subject.lower().startswith("re:")
+        else f"Re: {original_subject}"
     )
+
+    # -----------------------------------------------------
+    # AI REPLY GENERATION
+    # -----------------------------------------------------
 
     prompt = f"""
-You are an email assistant.
+You are a professional email assistant.
 
-Write a short, professional reply to the following email.
+Write a concise, polite reply to this email.
 
 Rules:
-- Do not invent information.
-- Do not add unnecessary details.
-- Keep the reply concise.
-- Return ONLY the email body.
-- Do not include a subject.
-- Do not include explanations.
+- Do not invent facts or commitments.
+- Do not promise meetings, payments, or actions.
+- Do not include a subject line.
+- Return only the email body.
 
 Email:
-{email}
+{state["email"]}
 """
 
     try:
         result = llm.invoke(prompt)
         draft_body = result.content.strip()
 
-    except Exception as e:
-        print("\nGemini API error while generating reply:")
-        print(e)
+        if not draft_body:
+            raise ValueError(
+                "AI generated an empty reply."
+            )
 
+        return {
+            "recipient": recipient,
+            "subject": reply_subject,
+            "draft_body": draft_body,
+            "response": draft_body,
+            "error_message": "",
+        }
+
+    except Exception as e:
         return {
             "category": "AI_ERROR",
             "error_message": str(e),
-            "response": (
-                "AI processing failed while generating "
-                "the reply. The email should be retried later."
-            ),
+            "response": "Reply generation failed.",
         }
 
-    return {
-        "recipient": recipient,
-        "subject": f"Re: {original_subject}",
-        "draft_body": draft_body,
-        "response": draft_body,
-        "error_message": "",
-    }
 
+# =========================================================
+# FYI EMAIL
+# =========================================================
 
 def handle_fyi(state: EmailAgentState):
     return {
         "category": "FYI",
         "response": (
-            "This email is informational "
-            "and does not require a reply."
-        )
+            "This email is informational and "
+            "does not require a reply."
+        ),
     }
 
 
+# =========================================================
+# ACTION NEEDED
+# =========================================================
+
 def handle_action(state: EmailAgentState):
     prompt = f"""
-You are an email assistant.
-
-Explain clearly what action the user needs to take.
+Explain what action the user needs to take.
 
 Do not perform the action.
-Only explain what the user needs to do.
+Do not invent missing information.
 
 Email:
 {state["email"]}
@@ -182,48 +227,44 @@ Email:
 
         return {
             "category": "ACTION_NEEDED",
-            "response": result.content.strip()
+            "response": result.content.strip(),
         }
 
     except Exception as e:
-        print("\nGemini API error while analyzing action:")
-        print(e)
-
         return {
             "category": "AI_ERROR",
             "error_message": str(e),
-            "response": (
-                "AI processing failed while determining "
-                "the required action. The email should be "
-                "retried later."
-            ),
+            "response": "Action analysis failed.",
         }
 
+
+# =========================================================
+# AI ERROR HANDLER
+# =========================================================
 
 def handle_ai_error(state: EmailAgentState):
     return {
         "category": "AI_ERROR",
         "response": (
             "AI processing failed. "
-            "The email was not classified and "
-            "should be retried later."
+            "No email was sent."
         ),
     }
 
 
+# =========================================================
+# HUMAN-IN-THE-LOOP APPROVAL
+# =========================================================
+
 def human_review(state: EmailAgentState):
-    decision = interrupt(
-        {
-            "message": "Please review the generated email draft.",
-            "to": state["recipient"],
-            "subject": state["subject"],
-            "draft": state["draft_body"],
-            "options": [
-                "approve",
-                "reject",
-            ],
-        }
-    )
+
+    decision = interrupt({
+        "message": "Review the generated reply.",
+        "to": state["recipient"],
+        "subject": state["subject"],
+        "draft": state["draft_body"],
+        "options": ["approve", "reject"],
+    })
 
     if isinstance(decision, dict):
         action = str(
@@ -232,36 +273,65 @@ def human_review(state: EmailAgentState):
 
         edited_draft = decision.get(
             "draft_body",
-            state["draft_body"]
+            state["draft_body"],
         )
 
     else:
         action = str(decision).strip().lower()
         edited_draft = state["draft_body"]
 
+    # Only explicit approval permits sending.
     if action == "approve":
+
+        if (
+            not isinstance(edited_draft, str)
+            or not edited_draft.strip()
+        ):
+            return {
+                "category": "REJECTED",
+                "review_status": "rejected",
+                "response": "Empty draft was not sent.",
+            }
+
         return {
             "review_status": "approved",
             "draft_body": edited_draft,
             "response": "Email approved.",
         }
 
+    # Reject and unknown decisions both stop sending.
     return {
         "category": "REJECTED",
         "review_status": "rejected",
-        "response": "Email rejected. It will not be sent.",
+        "response": (
+            "Email rejected. It will not be sent."
+        ),
     }
 
 
 def route_after_review(state: EmailAgentState):
-    if state["review_status"] == "approved":
+    if state.get("review_status") == "approved":
         return "send"
 
     return "stop"
 
 
+# =========================================================
+# SEND APPROVED EMAIL
+# =========================================================
+
 def send_approved_email(state: EmailAgentState):
+
     try:
+        if not all([
+            state.get("recipient"),
+            state.get("subject"),
+            state.get("draft_body"),
+        ]):
+            raise ValueError(
+                "Incomplete email draft."
+            )
+
         result = send_email(
             to=state["recipient"],
             subject=state["subject"],
@@ -271,68 +341,70 @@ def send_approved_email(state: EmailAgentState):
         return {
             "category": "SENT",
             "response": (
-                "Email sent successfully.\n\n"
+                "Email sent successfully.\n"
                 f"Message ID: {result['message_id']}"
             ),
         }
 
     except Exception as e:
-        print("\nGmail sending error:")
-        print(e)
-
         return {
             "category": "SEND_ERROR",
             "error_message": str(e),
-            "response": (
-                "The email could not be sent. "
-                "Please try again later."
-            ),
+            "response": "Email could not be sent.",
         }
 
+
+# =========================================================
+# BUILD LANGGRAPH
+# =========================================================
 
 graph_builder = StateGraph(EmailAgentState)
 
 graph_builder.add_node(
     "triage_email",
-    triage_email
+    triage_email,
 )
 
 graph_builder.add_node(
     "generate_reply",
-    generate_reply
+    generate_reply,
 )
 
 graph_builder.add_node(
     "handle_fyi",
-    handle_fyi
+    handle_fyi,
 )
 
 graph_builder.add_node(
     "handle_action",
-    handle_action
+    handle_action,
 )
 
 graph_builder.add_node(
     "handle_ai_error",
-    handle_ai_error
+    handle_ai_error,
 )
 
 graph_builder.add_node(
     "human_review",
-    human_review
+    human_review,
 )
 
 graph_builder.add_node(
     "send_approved_email",
-    send_approved_email
+    send_approved_email,
 )
 
+
+# ---------------- START ----------------
 
 graph_builder.add_edge(
     START,
-    "triage_email"
+    "triage_email",
 )
 
+
+# ---------------- CLASSIFICATION ROUTING ----------------
 
 graph_builder.add_conditional_edges(
     "triage_email",
@@ -342,23 +414,27 @@ graph_builder.add_conditional_edges(
         "fyi": "handle_fyi",
         "action": "handle_action",
         "error": "handle_ai_error",
-    }
+    },
 )
 
+
+# ---------------- REPLY ROUTING ----------------
 
 graph_builder.add_conditional_edges(
     "generate_reply",
     lambda state: (
         "error"
-        if state["category"] == "AI_ERROR"
+        if state.get("category") == "AI_ERROR"
         else "review"
     ),
     {
         "review": "human_review",
         "error": "handle_ai_error",
-    }
+    },
 )
 
+
+# ---------------- HUMAN REVIEW ROUTING ----------------
 
 graph_builder.add_conditional_edges(
     "human_review",
@@ -366,30 +442,36 @@ graph_builder.add_conditional_edges(
     {
         "send": "send_approved_email",
         "stop": END,
-    }
+    },
 )
 
 
+# ---------------- END ROUTES ----------------
+
 graph_builder.add_edge(
     "handle_fyi",
-    END
+    END,
 )
 
 graph_builder.add_edge(
     "handle_action",
-    END
+    END,
 )
 
 graph_builder.add_edge(
     "handle_ai_error",
-    END
+    END,
 )
 
 graph_builder.add_edge(
     "send_approved_email",
-    END
+    END,
 )
 
+
+# =========================================================
+# COMPILE GRAPH
+# =========================================================
 
 memory = MemorySaver()
 

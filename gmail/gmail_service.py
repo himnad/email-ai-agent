@@ -61,7 +61,7 @@ def get_gmail_service():
         )
 
         creds = flow.run_local_server(
-            host="127.0.0.1",
+            host="localhost",
             port=0
         )
 

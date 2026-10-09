@@ -1,6 +1,9 @@
-import sys
-from pathlib import Path
 
+import sys
+import time
+import uuid
+from pathlib import Path
+from email.utils import parseaddr
 
 # =========================================================
 # PROJECT ROOT
@@ -18,13 +21,8 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import streamlit as st
 
-from gmail.gmail_service import (
-    get_unread_emails,
-    mark_email_as_read,
-)
-
+from gmail.gmail_service import get_unread_emails
 from graph.email_agent_graph import email_agent_graph
-
 from langgraph.types import Command
 
 
@@ -38,18 +36,11 @@ st.set_page_config(
     layout="wide",
 )
 
-
-# =========================================================
-# TITLE
-# =========================================================
-
 st.title("📧 Email AI Agent")
 
-st.markdown(
-    """
-    AI-powered Gmail assistant with **human-in-the-loop
-    approval** before sending generated replies.
-    """
+st.write(
+    "AI-powered Gmail assistant with human-in-the-loop "
+    "approval before sending generated replies."
 )
 
 
@@ -57,21 +48,22 @@ st.markdown(
 # SESSION STATE
 # =========================================================
 
-if "emails" not in st.session_state:
-    st.session_state.emails = []
+defaults = {
+    "emails": [],
+    "current_index": 0,
+    "graph_result": None,
+    "thread_id": None,
+    "load_duration": None,
+}
 
-if "current_index" not in st.session_state:
-    st.session_state.current_index = 0
+for key, value in defaults.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
 
-if "graph_result" not in st.session_state:
+
+def reset_current_email():
     st.session_state.graph_result = None
-
-if "thread_id" not in st.session_state:
     st.session_state.thread_id = None
-
-# Prevent repeated Gmail READ calls during Streamlit reruns.
-if "read_status_handled" not in st.session_state:
-    st.session_state.read_status_handled = False
 
 
 # =========================================================
@@ -80,98 +72,71 @@ if "read_status_handled" not in st.session_state:
 
 if st.button("🔄 Load Unread Emails"):
 
-    with st.spinner("Connecting to Gmail..."):
+    start = time.monotonic()
 
-        try:
-
+    try:
+        with st.spinner("Connecting to Gmail..."):
             emails = get_unread_emails()
 
-            st.session_state.emails = emails
-            st.session_state.current_index = 0
-            st.session_state.graph_result = None
-            st.session_state.thread_id = None
-            st.session_state.read_status_handled = False
+        st.session_state.emails = emails
+        st.session_state.current_index = 0
+        st.session_state.load_duration = (
+            time.monotonic() - start
+        )
 
-            if emails:
+        reset_current_email()
 
-                st.success(
-                    f"Found {len(emails)} unread emails."
-                )
-
-                # Force Streamlit to run again so the
-                # loaded emails are displayed immediately.
-                st.rerun()
-
-            else:
-
-                st.info(
-                    "No unread emails found."
-                )
-
-        except Exception as e:
-
-            st.error(
-                f"Could not connect to Gmail:\n\n{e}"
-            )
+    except Exception as e:
+        st.error(f"Gmail connection failed: {e}")
+        st.exception(e)
 
 
-# =========================================================
-# NO EMAILS LOADED
-# =========================================================
-
-if not st.session_state.emails:
-
-    st.info(
-        "No unread emails loaded. "
-        "Click **Load Unread Emails** to begin."
+if st.session_state.load_duration is not None:
+    st.caption(
+        "Last Gmail fetch took "
+        f"{st.session_state.load_duration:.2f} seconds."
     )
 
+
+# =========================================================
+# DISPLAY EMAILS
+# =========================================================
+
+emails = st.session_state.emails
+
+if not emails:
+    st.info(
+        "No emails loaded. Click 'Load Unread Emails'."
+    )
     st.stop()
 
+st.success(f"Loaded {len(emails)} unread emails.")
 
-# =========================================================
-# CURRENT EMAIL
-# =========================================================
+index = st.session_state.current_index
 
-current_email = st.session_state.emails[
-    st.session_state.current_index
-]
+if index >= len(emails):
+    st.success("All loaded emails have been reviewed.")
+    st.stop()
 
+current_email = emails[index]
 
-# =========================================================
-# EMAIL HEADER
-# =========================================================
-
-st.divider()
+sender = current_email.get("sender", "")
+original_subject = current_email.get("subject", "")
+email_body = current_email.get("body", "")
 
 st.subheader(
-    f"📨 Email "
-    f"{st.session_state.current_index + 1} "
-    f"of "
-    f"{len(st.session_state.emails)}"
+    f"Email {index + 1} of {len(emails)}"
 )
 
-st.write(
-    f"**From:** {current_email['sender']}"
+st.write("**From:**", sender or "Unknown")
+st.write("**Subject:**", original_subject or "(No subject)")
+
+st.text_area(
+    "Email Body",
+    value=email_body,
+    height=200,
+    disabled=True,
 )
-
-st.write(
-    f"**Subject:** {current_email['subject']}"
-)
-
-
-# =========================================================
-# EMAIL BODY
-# =========================================================
-
-with st.expander(
-    "📨 View Email Body",
-    expanded=True,
-):
-
-    st.text(
-        current_email["body"]
-    )
 
 
 # =========================================================
@@ -180,593 +145,232 @@ with st.expander(
 
 if st.session_state.graph_result is None:
 
-    if st.button(
-        "🤖 Analyze Email",
-        type="primary",
-    ):
+    if st.button("🤖 Analyze Email"):
 
-        email = f"""
-FROM: {current_email["sender"]}
+        thread_id = str(uuid.uuid4())
 
-SUBJECT: {current_email["subject"]}
+        config = {
+            "configurable": {
+                "thread_id": thread_id
+            }
+        }
 
-BODY:
-
-{current_email["body"]}
-"""
-
-        with st.spinner(
-            "Gemini is analyzing the email..."
-        ):
-
-            try:
-
-                result = email_agent_graph.invoke(
-                    {
-                        "email": email,
-                        "category": "",
-                        "response": "",
-                        "recipient": "",
-                        "subject": "",
-                        "draft_body": "",
-                        "review_status": "",
-                        "error_message": "",
-                    },
-                    config={
-                        "configurable": {
-                            "thread_id":
-                                current_email["id"]
-                        }
-                    },
-                )
-
-                st.session_state.graph_result = result
-
-                st.session_state.thread_id = (
-                    current_email["id"]
-                )
-
-                st.session_state.read_status_handled = False
-
-                st.rerun()
-
-            except Exception as e:
-
-                st.error(
-                    f"Email processing failed:\n\n{e}"
-                )
-
-
-# =========================================================
-# DISPLAY AI RESULT
-# =========================================================
-
-if st.session_state.graph_result:
-
-    result = st.session_state.graph_result
-
-    st.divider()
-
-    st.subheader(
-        "🤖 AI Analysis"
-    )
-
-    category = result.get(
-        "category",
-        "",
-    )
-
-    if category:
-
-        st.write(
-            f"**Category:** `{category}`"
+        # The graph requires the "email" field.
+        # Include the original subject for AI context.
+        email_text = (
+            f"SUBJECT: {original_subject}\n\n"
+            f"{email_body}"
         )
 
-
-    # =====================================================
-    # HUMAN REVIEW
-    # =====================================================
-
-    if "__interrupt__" in result:
-
-        interrupt_data = result[
-            "__interrupt__"
-        ]
-
-        st.subheader(
-            "👤 Human Review Required"
-        )
-
-        st.warning(
-            "The AI generated a reply. "
-            "Review or edit it before sending."
-        )
+        initial_state = {
+            "email": email_text,
+            "sender": sender,
+            "original_subject": original_subject,
+        }
 
         try:
+            with st.spinner("AI is analyzing the email..."):
 
-            review = interrupt_data[0].value
+                result = email_agent_graph.invoke(
+                    initial_state,
+                    config=config,
+                )
 
-        except Exception:
+            st.session_state.thread_id = thread_id
+            st.session_state.graph_result = result
 
-            review = {}
+            st.rerun()
+
+        except Exception as e:
+            st.error(f"AI analysis failed: {e}")
+            st.exception(e)
 
 
-        recipient = review.get(
-            "to",
-            "",
+# =========================================================
+# SHOW AI ANALYSIS
+# =========================================================
+
+result = st.session_state.graph_result
+
+if result is not None:
+
+    st.divider()
+    st.subheader("AI Analysis")
+
+    category = result.get("category", "UNKNOWN")
+
+    st.write("**Category:**", category)
+
+    if result.get("error_message"):
+        st.error(result["error_message"])
+
+    interrupts = result.get("__interrupt__", [])
+
+    # =====================================================
+    # HUMAN REVIEW / GENERATED DRAFT
+    # =====================================================
+
+    if interrupts:
+
+        recipient = result.get("recipient", "")
+        reply_subject = result.get("subject", "")
+        draft_body = result.get("draft_body", "")
+
+        st.subheader("Generated Email Draft")
+
+        st.write("**To:**", recipient or "Missing recipient")
+        st.write(
+            "**Subject:**",
+            reply_subject or "Missing subject"
         )
 
-        subject = review.get(
-            "subject",
-            "",
-        )
-
-        draft = review.get(
-            "draft",
-            "",
-        )
-
-
-        # -------------------------------------------------
-        # RECIPIENT
-        # -------------------------------------------------
-
-        st.text_input(
-            "To",
-            value=recipient,
+        st.text_area(
+            "Generated Reply",
+            value=draft_body,
+            height=220,
             disabled=True,
+            key=f"draft_preview_{st.session_state.thread_id}",
         )
 
+        # Validate draft before allowing real Gmail send.
+        parsed_recipient = parseaddr(recipient)[1]
 
-        # -------------------------------------------------
-        # SUBJECT
-        # -------------------------------------------------
-
-        st.text_input(
-            "Subject",
-            value=subject,
-            disabled=True,
+        draft_ready = bool(
+            recipient
+            and parsed_recipient == recipient
+            and "@" in parsed_recipient
+            and "\n" not in recipient
+            and "\r" not in recipient
+            and isinstance(reply_subject, str)
+            and reply_subject.strip()
+            and "\n" not in reply_subject
+            and "\r" not in reply_subject
+            and isinstance(draft_body, str)
+            and draft_body.strip()
+            and st.session_state.thread_id
         )
 
+        if not draft_ready:
+            st.error(
+                "Draft is incomplete or invalid. "
+                "Sending is disabled."
+            )
 
-        # -------------------------------------------------
-        # EDITABLE DRAFT
-        # -------------------------------------------------
-
-        edited_draft = st.text_area(
-            "Reply",
-            value=draft,
-            height=250,
+        st.warning(
+            "Human approval required before sending."
         )
 
+        def resume_review(decision):
+
+            config = {
+                "configurable": {
+                    "thread_id": st.session_state.thread_id
+                }
+            }
+
+            return email_agent_graph.invoke(
+                Command(resume=decision),
+                config=config,
+            )
 
         col1, col2 = st.columns(2)
-
-
-        # =================================================
-        # APPROVE
-        # =================================================
 
         with col1:
 
             if st.button(
                 "✅ Approve & Send",
                 type="primary",
+                disabled=not draft_ready,
             ):
 
-                if not edited_draft.strip():
+                try:
+                    with st.spinner(
+                        "Sending approved email..."
+                    ):
+                        updated_result = resume_review(
+                            "approve"
+                        )
 
-                    st.error(
-                        "The reply cannot be empty."
+                    st.session_state.graph_result = (
+                        updated_result
                     )
 
-                else:
+                    st.rerun()
 
-                    with st.spinner(
-                        "Sending email..."
-                    ):
-
-                        try:
-
-                            final_result = (
-                                email_agent_graph.invoke(
-                                    Command(
-                                        resume={
-                                            "decision":
-                                                "approve",
-
-                                            "draft_body":
-                                                edited_draft,
-                                        }
-                                    ),
-                                    config={
-                                        "configurable": {
-                                            "thread_id":
-                                                st.session_state.thread_id
-                                        }
-                                    },
-                                )
-                            )
-
-                            st.session_state.graph_result = (
-                                final_result
-                            )
-
-
-                            # ---------------------------------
-                            # SUCCESSFUL SEND
-                            # ---------------------------------
-
-                            if (
-                                final_result.get(
-                                    "category"
-                                )
-                                == "SENT"
-                            ):
-
-                                marked_as_read = (
-                                    mark_email_as_read(
-                                        current_email["id"]
-                                    )
-                                )
-
-                                st.session_state.read_status_handled = True
-
-                                if marked_as_read:
-
-                                    st.success(
-                                        "Email approved, "
-                                        "sent, and marked as READ."
-                                    )
-
-                                else:
-
-                                    st.success(
-                                        "Email approved and sent."
-                                    )
-
-
-                            # ---------------------------------
-                            # SEND ERROR
-                            # ---------------------------------
-
-                            elif (
-                                final_result.get(
-                                    "category"
-                                )
-                                == "SEND_ERROR"
-                            ):
-
-                                # Keep the original email unread
-                                # because sending failed.
-
-                                st.session_state.read_status_handled = False
-
-                                st.error(
-                                    "The email could not be sent."
-                                )
-
-                            else:
-
-                                st.info(
-                                    final_result.get(
-                                        "response",
-                                        "Email processing finished.",
-                                    )
-                                )
-
-                            st.rerun()
-
-                        except Exception as e:
-
-                            st.error(
-                                f"Email sending failed:\n\n{e}"
-                            )
-
-
-        # =================================================
-        # REJECT
-        # =================================================
+                except Exception as e:
+                    st.error(f"Approval failed: {e}")
+                    st.exception(e)
 
         with col2:
 
-            if st.button(
-                "❌ Reject"
-            ):
+            if st.button("❌ Reject"):
 
-                with st.spinner(
-                    "Rejecting email..."
-                ):
+                try:
+                    with st.spinner("Rejecting draft..."):
 
-                    try:
-
-                        final_result = (
-                            email_agent_graph.invoke(
-                                Command(
-                                    resume={
-                                        "decision":
-                                            "reject",
-
-                                        "draft_body":
-                                            edited_draft,
-                                    }
-                                ),
-                                config={
-                                    "configurable": {
-                                        "thread_id":
-                                            st.session_state.thread_id
-                                    }
-                                },
-                            )
+                        updated_result = resume_review(
+                            "reject"
                         )
 
-                        st.session_state.graph_result = (
-                            final_result
-                        )
+                    st.session_state.graph_result = (
+                        updated_result
+                    )
 
-                        st.session_state.read_status_handled = False
+                    st.rerun()
 
-                        st.rerun()
-
-                    except Exception as e:
-
-                        st.error(
-                            f"Could not reject email:\n\n{e}"
-                        )
-
+                except Exception as e:
+                    st.error(f"Rejection failed: {e}")
+                    st.exception(e)
 
     # =====================================================
-    # FINAL RESULT
+    # COMPLETED WORKFLOW
     # =====================================================
 
     else:
 
-        response = result.get(
-            "response",
-            "",
-        )
+        if result.get("response"):
+            st.info(result["response"])
 
-        if response:
-
-            st.subheader(
-                "📋 Result"
+        if category == "SENT":
+            st.success(
+                "Email approved and sent successfully."
             )
 
-
-            # =================================================
-            # AI ERROR
-            # =================================================
-
-            if (
-                result.get("category")
-                == "AI_ERROR"
-            ):
-
-                # AI errors remain unread so the user
-                # can retry processing the email.
-
-                st.session_state.read_status_handled = False
-
-                st.error(
-                    "Gemini could not process this email."
-                )
-
-                st.warning(
-                    "The Gemini API quota may be exhausted "
-                    "or the service may be temporarily unavailable."
-                )
-
-                error_message = result.get(
-                    "error_message",
-                    "",
-                )
-
-                if error_message:
-
-                    st.caption(
-                        f"Technical details: {error_message}"
-                    )
-
-                st.info(
-                    "Please wait for the Gemini quota "
-                    "to become available and try again."
-                )
-
-
-            # =================================================
-            # SEND ERROR
-            # =================================================
-
-            elif (
-                result.get("category")
-                == "SEND_ERROR"
-            ):
-
-                # The original email stays unread because
-                # the reply was not successfully sent.
-
-                st.session_state.read_status_handled = False
-
-                st.error(
-                    "The email could not be sent."
-                )
-
-                st.info(
-                    response
-                )
-
-
-            # =================================================
-            # REJECTED
-            # =================================================
-
-            elif (
-                result.get("category")
-                == "REJECTED"
-            ):
-
-                if not st.session_state.read_status_handled:
-
-                    marked_as_read = mark_email_as_read(
-                        current_email["id"]
-                    )
-
-                    st.session_state.read_status_handled = True
-
-                else:
-
-                    marked_as_read = True
-
-                if marked_as_read:
-
-                    st.success(
-                        "Email rejected and marked as READ. "
-                        "It was not sent."
-                    )
-
-                else:
-
-                    st.warning(
-                        "Email rejected, but Gmail "
-                        "could not mark it as READ."
-                    )
-
-
-            # =================================================
-            # SENT
-            # =================================================
-
-            elif (
-                result.get("category")
-                == "SENT"
-            ):
-
-                st.success(
-                    response
-                )
-
-
-            # =================================================
-            # FYI
-            # =================================================
-
-            elif (
-                result.get("category")
-                == "FYI"
-            ):
-
-                if not st.session_state.read_status_handled:
-
-                    marked_as_read = mark_email_as_read(
-                        current_email["id"]
-                    )
-
-                    st.session_state.read_status_handled = True
-
-                else:
-
-                    marked_as_read = True
-
-                if marked_as_read:
-
-                    st.success(
-                        "FYI email processed "
-                        "and marked as READ."
-                    )
-
-                else:
-
-                    st.warning(
-                        "FYI email was processed, "
-                        "but Gmail could not mark it as READ."
-                    )
-
-                st.info(
-                    response
-                )
-
-
-            # =================================================
-            # ACTION NEEDED
-            # =================================================
-
-            elif (
-                result.get("category")
-                == "ACTION_NEEDED"
-            ):
-
-                if not st.session_state.read_status_handled:
-
-                    marked_as_read = mark_email_as_read(
-                        current_email["id"]
-                    )
-
-                    st.session_state.read_status_handled = True
-
-                else:
-
-                    marked_as_read = True
-
-                if marked_as_read:
-
-                    st.success(
-                        "Action-needed email processed "
-                        "and marked as READ."
-                    )
-
-                else:
-
-                    st.warning(
-                        "Action-needed email was processed, "
-                        "but Gmail could not mark it as READ."
-                    )
-
-                st.info(
-                    response
-                )
-
-
-            # =================================================
-            # OTHER RESULT
-            # =================================================
-
-            else:
-
-                st.info(
-                    response
-                )
-
-
-# =========================================================
-# NEXT EMAIL
-# =========================================================
-
-if (
-    st.session_state.graph_result
-    and "__interrupt__"
-    not in st.session_state.graph_result
-):
-
-    st.divider()
-
-    if (
-        st.session_state.current_index
-        < len(st.session_state.emails) - 1
-    ):
-
-        if st.button(
-            "➡️ Process Next Email"
-        ):
+        elif category == "REJECTED":
+            st.success(
+                "Email rejected. No reply was sent "
+                "by this workflow."
+            )
+
+        elif category == "FYI":
+            st.info(
+                "This email is informational. "
+                "No reply is required."
+            )
+
+        elif category == "ACTION_NEEDED":
+            st.warning(
+                "This email requires an action."
+            )
+
+        elif category == "AI_ERROR":
+            st.error(
+                "AI processing failed. "
+                "No email was sent."
+            )
+
+        elif category == "SEND_ERROR":
+            st.error(
+                "Email sending failed."
+            )
+
+        else:
+            st.info("Graph execution completed.")
+
+        if st.button("➡️ Next Email"):
 
             st.session_state.current_index += 1
-            st.session_state.graph_result = None
-            st.session_state.thread_id = None
-            st.session_state.read_status_handled = False
+
+            reset_current_email()
 
             st.rerun()
-
-    else:
-
-        st.success(
-            "🎉 All loaded emails have been processed."
-        )
