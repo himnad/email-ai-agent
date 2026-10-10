@@ -1,100 +1,150 @@
-\# Email AI Agent
+# Email AI Agent
 
+**AI-powered Gmail triage and reply drafting with LangGraph, Google Gemini, and human-in-the-loop approval.**
 
+[![Python](https://img.shields.io/badge/Python-3.x-blue?logo=python)](https://www.python.org/)
+[![LangGraph](https://img.shields.io/badge/Workflow-LangGraph-blueviolet)](https://github.com/langchain-ai/langgraph)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-An AI-powered email management agent that connects to Gmail, classifies incoming emails, generates replies when required, and uses a human-in-the-loop approval step before sending emails.
+**[Try the Streamlit demo](https://email-ai-agent-eqmi8z5twq97kwglgfdi2g.streamlit.app)** · **[View source](https://github.com/himnad/email-ai-agent)**
 
+## Overview
 
+Email AI Agent helps triage incoming Gmail messages and draft appropriate replies. It uses Google Gemini for classification and generation, while **keeping a human approval step before any generated reply is sent**.
 
-\## Features
+The repository includes a Gmail-integrated application and a separate Streamlit demonstration. The demo is intended to showcase the workflow; **do not assume the public demo sends real emails**.
 
+## Features
 
+- Read unread messages using the Gmail API.
+- Classify messages into `NEEDS_REPLY`, `FYI`, and `ACTION_NEEDED`.
+- Generate concise, professional reply drafts with Gemini.
+- Request human approval before sending generated replies.
+- Send approved replies via the Gmail API; rejected drafts are not sent.
+- Explain follow-up actions for action-oriented emails.
+- Handle AI/API failures without treating failed operations as successful.
+- Orchestrate branching decisions with LangGraph.
+- Include tests using mocked external services.
 
-\- Read unread emails from Gmail
+## Workflow
 
-\- Automatically classify emails into:
+```mermaid
+flowchart TD
+    A[Gmail inbox] --> B[Read unread emails]
+    B --> C[Gemini classification]
+    C --> D{Triage result}
+    D -->|NEEDS_REPLY| E[Generate reply draft]
+    D -->|FYI| F[No reply needed]
+    D -->|ACTION_NEEDED| G[Explain required action]
+    E --> H{Human review}
+    H -->|Approve| I[Send via Gmail API]
+    H -->|Reject| J[Do not send]
+```
 
-&#x20; - `NEEDS\_REPLY`
+**Safety principle:** AI generates drafts; a person decides whether to send them.
 
-&#x20; - `FYI`
+## Tech Stack
 
-&#x20; - `ACTION\_NEEDED`
+| Area | Technology |
+| --- | --- |
+| Language | Python |
+| Workflow orchestration | LangGraph |
+| LLM | Google Gemini (`langchain-google-genai` / Google Gen AI SDK) |
+| Email integration | Gmail API, Google OAuth |
+| Public demo | Streamlit |
+| Configuration | `python-dotenv` |
+| Testing | Python test modules and mocked integrations |
 
-\- Generate concise professional replies using Google Gemini
-
-\- Human approval before sending generated replies
-
-\- Send approved replies through the Gmail API
-
-\- Explain required actions for action-oriented emails
-
-\- Handle AI/API failures without marking emails as successfully processed
-
-\- LangGraph-based workflow orchestration
-
-\- Unit and integration tests with mocked external services
-
-
-
-\## Architecture
-
-
+## Repository Structure
 
 ```text
+email-agent/
+├── agent/                 # LLM and agent logic
+├── gmail/                 # Gmail service integration
+├── graph/                 # LangGraph workflows
+├── tools/                 # Email-related tools
+├── ui/                    # Application UI
+├── web_app/               # Web app and OAuth integration
+├── demo/                  # Streamlit demo and its requirements
+├── tests/                 # Tests
+├── main.py                # Application entry point
+├── requirements.txt       # Main app dependencies
+├── README.md
+└── LICENSE
+```
 
-&#x20;                   Gmail Inbox
+## Getting Started
 
-&#x20;                        |
+### 1. Clone the repository
 
-&#x20;                        v
+```bash
+git clone https://github.com/himnad/email-ai-agent.git
+cd email-ai-agent
+```
 
-&#x20;                Read Unread Emails
+### 2. Create a virtual environment
 
-&#x20;                        |
+**Windows CMD:**
 
-&#x20;                        v
+```cmd
+py -m venv venv
+venv\Scripts\activate
+```
 
-&#x20;                 Gemini / LLM
+### 3. Install dependencies
 
-&#x20;                        |
+For the main application:
 
-&#x20;                        v
+```cmd
+pip install -r requirements.txt
+```
 
-&#x20;                    TRIAGE
+For the Streamlit demo (in the same or a separate virtual environment):
 
-&#x20;                /      |       \\
+```cmd
+pip install -r demo\requirements.txt
+```
 
-&#x20;               /       |        \\
+### 4. Configure credentials for Gmail-integrated mode
 
-&#x20;              v        v         v
+The real Gmail-integrated application requires appropriate Google Cloud Gmail API/OAuth configuration and Gemini API access. Configure the credentials and environment variables expected by your local application code before running it.
 
-&#x20;       NEEDS\_REPLY     FYI    ACTION\_NEEDED
+**Never commit API keys, OAuth client secrets, access/refresh tokens, or private email content.** Keep secrets in local environment variables or ignored files. Google OAuth redirect URIs must match the URI configured for the application.
 
-&#x20;            |           |          |
+### 5. Run the public-style demo locally
 
-&#x20;            v           v          v
+```cmd
+streamlit run demo\app.py
+```
 
-&#x20;     Generate Reply   No Reply   Explain Action
+The demo and Gmail-integrated application are different execution paths. Demo behavior should not be presented as proof that real Gmail sending or OAuth is deployed publicly.
 
-&#x20;            |
+## Testing
 
-&#x20;            v
+The repository includes `tests/test_graph.py` for graph-related testing. Run it using the test runner configured in your environment; for example, if `pytest` is installed:
 
-&#x20;      Human Review
+```cmd
+python -m pytest tests\test_graph.py
+```
 
-&#x20;       /          \\
+This command has not been verified against every environment; install any missing test dependencies as needed.
 
-&#x20;      /            \\
+## Security and Limitations
 
-&#x20;  APPROVE          REJECT
+- Human approval is required before sending AI-generated drafts.
+- Review generated content for accuracy and tone before approving.
+- Do not expose Gmail credentials or tokens in the public repository.
+- The Streamlit demo is a showcase; the real Gmail integration needs separate authorization and configuration.
+- Gmail OAuth access may be restricted by Google Cloud app publishing or test-user settings.
+- AI classification and drafts can be incorrect; they require user oversight.
 
-&#x20;     |                |
+## Roadmap
 
-&#x20;     v                v
+- [ ] Add architecture and UI screenshots.
+- [ ] Document exact OAuth setup and entry-point commands after verification.
+- [ ] Add CI checks for the existing test suite.
+- [ ] Add an example environment configuration with placeholder values only.
 
-&#x20; Gmail Send       No Email Sent
+## License
 
-
-## Live Demo
-
-[Try AI Email Agent](https://email-ai-agent-eqmi8z5twq97kwglgfdi2g.streamlit.app)
+Licensed under the [MIT License](LICENSE). Third-party packages and services retain their own licenses and terms.
