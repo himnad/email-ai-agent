@@ -34,4 +34,4 @@ safemail/*.sqlite3
 # Local backups
 *.bak
 secrets/
-*.sqlite3
+*.sqlite3approval_service/approvals.db
