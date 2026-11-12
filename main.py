@@ -1,7 +1,5 @@
-from gmail.gmail_service import (
-    get_unread_emails,
-    mark_email_as_read
-)
+
+from gmail.gmail_service import get_unread_emails
 
 from graph.email_agent_graph import email_agent_graph
 
@@ -37,7 +35,6 @@ for index, email_data in enumerate(emails, start=1):
     print("From:", email_data["sender"])
     print("Subject:", email_data["subject"])
 
-
     # -----------------------------------------------------
     # Prepare email for LangGraph
     # -----------------------------------------------------
@@ -50,7 +47,6 @@ SUBJECT: {email_data["subject"]}
 BODY:
 {email_data["body"]}
 """
-
 
     # -----------------------------------------------------
     # Run LangGraph
@@ -73,7 +69,6 @@ BODY:
         }
     )
 
-
     # =====================================================
     # 3. HUMAN REVIEW
     # =====================================================
@@ -85,7 +80,6 @@ BODY:
         print("\nReview Data:")
         print(result["__interrupt__"])
 
-
         # -------------------------------------------------
         # Ask the user for approval
         # -------------------------------------------------
@@ -93,7 +87,6 @@ BODY:
         decision = input(
             "\nEnter approve or reject: "
         ).strip().lower()
-
 
         # -------------------------------------------------
         # Validate user input
@@ -110,7 +103,6 @@ BODY:
                 "\nEnter approve or reject: "
             ).strip().lower()
 
-
         # -------------------------------------------------
         # Resume the interrupted graph
         # -------------------------------------------------
@@ -124,7 +116,6 @@ BODY:
             }
         )
 
-
     # =====================================================
     # 4. DISPLAY FINAL RESULT
     # =====================================================
@@ -133,25 +124,16 @@ BODY:
     print("FINAL RESULT")
     print("----------------------------------------")
 
-    print(result["response"])
-
+    print(result.get("response", "No response returned."))
 
     # =====================================================
-    # 5. CHECK FOR AI ERROR
+    # 5. HANDLE AI ERRORS
     # =====================================================
-
-    # If Gemini failed:
-    #
-    # 1. Do NOT mark the email as read.
-    # 2. Stop processing the remaining emails.
-    #
-    # This allows the failed email to be retried later.
 
     if result.get("category") == "AI_ERROR":
 
         print(
-            "\nEmail was NOT marked as READ "
-            "because AI processing failed."
+            "\nAI processing failed."
         )
 
         print(
@@ -159,26 +141,22 @@ BODY:
         )
 
         print(
-            "The remaining emails will be processed "
-            "when the AI service is available again."
+            "The unread email will remain in your inbox "
+            "and can be retried later."
         )
 
         break
 
-
     # =====================================================
-    # 6. MARK SUCCESSFULLY PROCESSED EMAIL AS READ
+    # 6. EMAIL PROCESSING STATUS
     # =====================================================
 
-    marked_as_read = mark_email_as_read(
-    email_data["id"]
+    print(
+        "\nEmail processing completed."
     )
 
-    if marked_as_read:
-        print("\nEmail marked as READ.")
-    else:
-        print(
-        "\nEmail could not be marked as READ."
+    print(
+        "The original email remains unread."
     )
 
 

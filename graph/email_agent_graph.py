@@ -1,14 +1,36 @@
 
+import os
 import re
 from email.utils import parseaddr
 from typing import TypedDict
+
+from dotenv import load_dotenv
 
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import interrupt
 
 from agent.llm import llm
-from tools.email_tools import send_email
+
+from safemail.authorization import (
+    issue_approval,
+    ApprovalError
+)
+
+from safemail.policy_engine import (
+    evaluate_email_action,
+    BLOCK,
+    REQUIRE_HUMAN_REVIEW
+)
+
+from safemail.gateway import (
+    execute_approved_email,
+    GatewayError
+)
+
+
+# Load environment variables.
+load_dotenv()
 
 
 # =========================================================
@@ -18,6 +40,7 @@ from tools.email_tools import send_email
 class EmailAgentState(TypedDict, total=False):
     email: str
     sender: str
+    reply_to: str
     original_subject: str
 
     category: str
@@ -28,6 +51,7 @@ class EmailAgentState(TypedDict, total=False):
     draft_body: str
 
     review_status: str
+    approval: dict
     error_message: str
 
 
@@ -36,6 +60,7 @@ class EmailAgentState(TypedDict, total=False):
 # =========================================================
 
 def triage_email(state: EmailAgentState):
+
     prompt = f"""
 You are an email triage assistant.
 
@@ -62,7 +87,7 @@ Email:
         if category not in {
             "NEEDS_REPLY",
             "FYI",
-            "ACTION_NEEDED",
+            "ACTION_NEEDED"
         }:
             raise ValueError(
                 f"Invalid AI classification: {category}"
@@ -70,17 +95,18 @@ Email:
 
         return {
             "category": category,
-            "error_message": "",
+            "error_message": ""
         }
 
     except Exception as e:
         return {
             "category": "AI_ERROR",
-            "error_message": str(e),
+            "error_message": str(e)
         }
 
 
 def route_email(state: EmailAgentState):
+
     category = state.get("category")
 
     if category == "NEEDS_REPLY":
@@ -100,6 +126,7 @@ def route_email(state: EmailAgentState):
 # =========================================================
 
 def generate_reply(state: EmailAgentState):
+
     sender = state.get("sender", "")
     recipient = parseaddr(sender)[1]
 
@@ -115,25 +142,24 @@ def generate_reply(state: EmailAgentState):
             "error_message": "Invalid sender email address.",
             "response": (
                 "Reply recipient could not be identified."
-            ),
+            )
         }
 
     # -----------------------------------------------------
     # SUBJECT EXTRACTION
     # -----------------------------------------------------
 
-    # First preference: structured subject from Gmail/UI.
     original_subject = (
         state.get("original_subject") or ""
     ).strip()
 
-    # Backward compatibility with existing tests:
-    # Extract SUBJECT: from email text when needed.
+    # Backward compatibility with existing tests.
     if not original_subject:
+
         match = re.search(
             r"^SUBJECT:\s*(.+)$",
             state.get("email", ""),
-            flags=re.IGNORECASE | re.MULTILINE,
+            flags=re.IGNORECASE | re.MULTILINE
         )
 
         if match:
@@ -142,7 +168,7 @@ def generate_reply(state: EmailAgentState):
     if not original_subject:
         original_subject = "Email"
 
-    # Avoid "Re: Re: ..." duplication.
+    # Avoid Re: Re: duplication.
     reply_subject = (
         original_subject
         if original_subject.lower().startswith("re:")
@@ -182,14 +208,14 @@ Email:
             "subject": reply_subject,
             "draft_body": draft_body,
             "response": draft_body,
-            "error_message": "",
+            "error_message": ""
         }
 
     except Exception as e:
         return {
             "category": "AI_ERROR",
             "error_message": str(e),
-            "response": "Reply generation failed.",
+            "response": "Reply generation failed."
         }
 
 
@@ -198,12 +224,13 @@ Email:
 # =========================================================
 
 def handle_fyi(state: EmailAgentState):
+
     return {
         "category": "FYI",
         "response": (
             "This email is informational and "
             "does not require a reply."
-        ),
+        )
     }
 
 
@@ -212,6 +239,7 @@ def handle_fyi(state: EmailAgentState):
 # =========================================================
 
 def handle_action(state: EmailAgentState):
+
     prompt = f"""
 Explain what action the user needs to take.
 
@@ -227,14 +255,14 @@ Email:
 
         return {
             "category": "ACTION_NEEDED",
-            "response": result.content.strip(),
+            "response": result.content.strip()
         }
 
     except Exception as e:
         return {
             "category": "AI_ERROR",
             "error_message": str(e),
-            "response": "Action analysis failed.",
+            "response": "Action analysis failed."
         }
 
 
@@ -243,12 +271,13 @@ Email:
 # =========================================================
 
 def handle_ai_error(state: EmailAgentState):
+
     return {
         "category": "AI_ERROR",
         "response": (
             "AI processing failed. "
             "No email was sent."
-        ),
+        )
     }
 
 
@@ -258,99 +287,263 @@ def handle_ai_error(state: EmailAgentState):
 
 def human_review(state: EmailAgentState):
 
+    # Present the exact email draft for human review.
     decision = interrupt({
         "message": "Review the generated reply.",
         "to": state["recipient"],
         "subject": state["subject"],
         "draft": state["draft_body"],
-        "options": ["approve", "reject"],
+        "options": ["approve", "reject"]
     })
 
     if isinstance(decision, dict):
+
         action = str(
             decision.get("decision", "")
         ).strip().lower()
 
         edited_draft = decision.get(
             "draft_body",
-            state["draft_body"],
+            state["draft_body"]
         )
 
     else:
         action = str(decision).strip().lower()
         edited_draft = state["draft_body"]
 
-    # Only explicit approval permits sending.
-    if action == "approve":
+    # Only explicit approval is accepted.
+    if action != "approve":
 
-        if (
-            not isinstance(edited_draft, str)
-            or not edited_draft.strip()
-        ):
-            return {
-                "category": "REJECTED",
-                "review_status": "rejected",
-                "response": "Empty draft was not sent.",
-            }
+        return {
+            "category": "REJECTED",
+            "review_status": "rejected",
+            "approval": None,
+            "response": (
+                "Email rejected. It will not be sent."
+            )
+        }
+
+    if (
+        not isinstance(edited_draft, str)
+        or not edited_draft.strip()
+    ):
+        return {
+            "category": "REJECTED",
+            "review_status": "rejected",
+            "approval": None,
+            "response": "Empty draft was not sent."
+        }
+
+    recipient = state.get("recipient", "")
+    subject = state.get("subject", "")
+    sender = state.get("sender", "")
+    reply_to = state.get("reply_to")
+
+    # -----------------------------------------------------
+    # POLICY EVALUATION
+    # -----------------------------------------------------
+
+    policy = evaluate_email_action(
+        recipient=recipient,
+        subject=subject,
+        body=edited_draft,
+        from_header=sender,
+        reply_to_header=reply_to
+    )
+
+    if policy["decision"] == BLOCK:
+
+        return {
+            "category": "SEND_BLOCKED",
+            "review_status": "rejected",
+            "approval": None,
+            "error_message": "; ".join(
+                policy["reasons"]
+            ),
+            "response": (
+                "Email blocked by security policy."
+            )
+        }
+
+    if policy["decision"] != REQUIRE_HUMAN_REVIEW:
+
+        return {
+            "category": "SEND_BLOCKED",
+            "review_status": "rejected",
+            "approval": None,
+            "response": (
+                "Unexpected policy decision. "
+                "Email was not sent."
+            )
+        }
+
+    # -----------------------------------------------------
+    # SIGNING KEY VALIDATION
+    # -----------------------------------------------------
+
+    secret = os.getenv("SAFEMAIL_SIGNING_KEY")
+
+    if not secret or len(secret) < 32:
+
+        return {
+            "category": "SEND_BLOCKED",
+            "review_status": "rejected",
+            "approval": None,
+            "error_message": (
+                "SafeMail signing key is missing or invalid."
+            ),
+            "response": (
+                "Email not sent: authorization unavailable."
+            )
+        }
+
+    # -----------------------------------------------------
+    # ISSUE SIGNED APPROVAL
+    # -----------------------------------------------------
+
+    try:
+
+        approval = issue_approval(
+            recipient=recipient,
+            subject=subject,
+            body=edited_draft,
+            secret=secret,
+            db_path="safemail/approvals.db",
+            ttl_seconds=300
+        )
 
         return {
             "review_status": "approved",
             "draft_body": edited_draft,
-            "response": "Email approved.",
+            "approval": approval,
+            "response": (
+                "Email approved. "
+                "Secure authorization issued."
+            )
         }
 
-    # Reject and unknown decisions both stop sending.
-    return {
-        "category": "REJECTED",
-        "review_status": "rejected",
-        "response": (
-            "Email rejected. It will not be sent."
-        ),
-    }
+    except Exception as exc:
 
+        return {
+            "category": "SEND_BLOCKED",
+            "review_status": "rejected",
+            "approval": None,
+            "error_message": str(exc),
+            "response": (
+                "Email not sent: approval could not be issued."
+            )
+        }
+
+
+# =========================================================
+# ROUTE AFTER HUMAN REVIEW
+# =========================================================
 
 def route_after_review(state: EmailAgentState):
-    if state.get("review_status") == "approved":
+
+    if (
+        state.get("review_status") == "approved"
+        and state.get("approval")
+    ):
         return "send"
 
     return "stop"
 
 
 # =========================================================
-# SEND APPROVED EMAIL
+# SECURE EMAIL EXECUTION
 # =========================================================
 
 def send_approved_email(state: EmailAgentState):
 
-    try:
-        if not all([
-            state.get("recipient"),
-            state.get("subject"),
-            state.get("draft_body"),
-        ]):
-            raise ValueError(
-                "Incomplete email draft."
-            )
+    # Require human approval and signed authorization.
+    if (
+        state.get("review_status") != "approved"
+        or not state.get("approval")
+    ):
 
-        result = send_email(
-            to=state["recipient"],
-            subject=state["subject"],
-            body=state["draft_body"],
+        return {
+            "category": "SEND_BLOCKED",
+            "error_message": (
+                "Valid human authorization is required."
+            ),
+            "response": (
+                "Email was not sent: authorization is missing."
+            )
+        }
+
+    recipient = state.get("recipient")
+    subject = state.get("subject")
+    body = state.get("draft_body")
+
+    if not all([recipient, subject, body]):
+
+        return {
+            "category": "SEND_BLOCKED",
+            "error_message": "Incomplete email draft.",
+            "response": (
+                "Email was not sent: incomplete draft."
+            )
+        }
+
+    secret = os.getenv("SAFEMAIL_SIGNING_KEY")
+
+    if not secret or len(secret) < 32:
+
+        return {
+            "category": "SEND_BLOCKED",
+            "error_message": (
+                "SafeMail signing key is missing or invalid."
+            ),
+            "response": (
+                "Email was not sent: authorization unavailable."
+            )
+        }
+
+    try:
+
+        result = execute_approved_email(
+            approval=state["approval"],
+            recipient=recipient,
+            subject=subject,
+            body=body,
+            secret=secret,
+            db_path="safemail/approvals.db",
+            from_header=state.get("sender"),
+            reply_to_header=state.get("reply_to")
         )
 
         return {
             "category": "SENT",
+            "review_status": "consumed",
+            "approval": None,
             "response": (
                 "Email sent successfully.\n"
-                f"Message ID: {result['message_id']}"
-            ),
+                f"Message ID: {result.get('message_id', 'Not returned')}"
+            )
         }
 
-    except Exception as e:
+    except GatewayError as exc:
+
         return {
             "category": "SEND_ERROR",
-            "error_message": str(e),
-            "response": "Email could not be sent.",
+            "review_status": "authorization_failed",
+            "approval": None,
+            "error_message": str(exc),
+            "response": (
+                "Email could not be sent or "
+                "its outcome is uncertain."
+            )
+        }
+
+    except Exception as exc:
+
+        return {
+            "category": "SEND_ERROR",
+            "review_status": "authorization_failed",
+            "approval": None,
+            "error_message": str(exc),
+            "response": "Email could not be sent."
         }
 
 
@@ -360,39 +553,40 @@ def send_approved_email(state: EmailAgentState):
 
 graph_builder = StateGraph(EmailAgentState)
 
+
 graph_builder.add_node(
     "triage_email",
-    triage_email,
+    triage_email
 )
 
 graph_builder.add_node(
     "generate_reply",
-    generate_reply,
+    generate_reply
 )
 
 graph_builder.add_node(
     "handle_fyi",
-    handle_fyi,
+    handle_fyi
 )
 
 graph_builder.add_node(
     "handle_action",
-    handle_action,
+    handle_action
 )
 
 graph_builder.add_node(
     "handle_ai_error",
-    handle_ai_error,
+    handle_ai_error
 )
 
 graph_builder.add_node(
     "human_review",
-    human_review,
+    human_review
 )
 
 graph_builder.add_node(
     "send_approved_email",
-    send_approved_email,
+    send_approved_email
 )
 
 
@@ -400,7 +594,7 @@ graph_builder.add_node(
 
 graph_builder.add_edge(
     START,
-    "triage_email",
+    "triage_email"
 )
 
 
@@ -413,8 +607,8 @@ graph_builder.add_conditional_edges(
         "reply": "generate_reply",
         "fyi": "handle_fyi",
         "action": "handle_action",
-        "error": "handle_ai_error",
-    },
+        "error": "handle_ai_error"
+    }
 )
 
 
@@ -429,8 +623,8 @@ graph_builder.add_conditional_edges(
     ),
     {
         "review": "human_review",
-        "error": "handle_ai_error",
-    },
+        "error": "handle_ai_error"
+    }
 )
 
 
@@ -441,8 +635,8 @@ graph_builder.add_conditional_edges(
     route_after_review,
     {
         "send": "send_approved_email",
-        "stop": END,
-    },
+        "stop": END
+    }
 )
 
 
@@ -450,27 +644,27 @@ graph_builder.add_conditional_edges(
 
 graph_builder.add_edge(
     "handle_fyi",
-    END,
+    END
 )
 
 graph_builder.add_edge(
     "handle_action",
-    END,
+    END
 )
 
 graph_builder.add_edge(
     "handle_ai_error",
-    END,
+    END
 )
 
 graph_builder.add_edge(
     "send_approved_email",
-    END,
+    END
 )
 
 
 # =========================================================
-# COMPILE GRAPH
+# COMPILE LANGGRAPH
 # =========================================================
 
 memory = MemorySaver()

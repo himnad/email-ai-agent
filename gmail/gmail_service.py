@@ -1,87 +1,9 @@
-import os
-import pickle
+
 import base64
 
 from bs4 import BeautifulSoup
 
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from googleapiclient.discovery import build
-
-
-# =========================================================
-# GMAIL CONFIGURATION
-# =========================================================
-
-SCOPES = [
-    "https://www.googleapis.com/auth/gmail.modify"
-]
-
-
-# =========================================================
-# GET GMAIL SERVICE
-# =========================================================
-
-def get_gmail_service():
-    """
-    Authenticate with Gmail and return the Gmail API service.
-    """
-
-    creds = None
-
-    # -----------------------------------------------------
-    # Load previously saved token
-    # -----------------------------------------------------
-
-    if os.path.exists("gmail_token.pickle"):
-
-        with open("gmail_token.pickle", "rb") as token:
-            creds = pickle.load(token)
-
-
-    # -----------------------------------------------------
-    # Refresh expired credentials
-    # -----------------------------------------------------
-
-    if creds and creds.expired and creds.refresh_token:
-
-        creds.refresh(Request())
-
-
-    # -----------------------------------------------------
-    # Create new OAuth credentials if necessary
-    # -----------------------------------------------------
-
-    if not creds or not creds.valid:
-
-        flow = InstalledAppFlow.from_client_secrets_file(
-            "credentials.json",
-            SCOPES
-        )
-
-        creds = flow.run_local_server(
-            host="localhost",
-            port=0
-        )
-
-
-        # Save credentials for future runs
-        with open("gmail_token.pickle", "wb") as token:
-            pickle.dump(creds, token)
-
-
-    # -----------------------------------------------------
-    # Build Gmail API service
-    # -----------------------------------------------------
-
-    service = build(
-        "gmail",
-        "v1",
-        credentials=creds
-    )
-
-    return service
+from gmail.agent_gmail_service import get_agent_gmail_service
 
 
 # =========================================================
@@ -89,14 +11,9 @@ def get_gmail_service():
 # =========================================================
 
 def clean_html(html):
-    """
-    Convert HTML email content into readable plain text.
-    """
+    """Convert HTML email content into readable plain text."""
 
-    soup = BeautifulSoup(
-        html,
-        "html.parser"
-    )
+    soup = BeautifulSoup(html, "html.parser")
 
     return soup.get_text(
         separator="\n",
@@ -109,149 +26,130 @@ def clean_html(html):
 # =========================================================
 
 def extract_email_body(payload):
-    """
-    Extract the readable body from a Gmail message payload.
-    """
-
-    # -----------------------------------------------------
-    # Multipart email
-    # -----------------------------------------------------
+    """Extract readable text from Gmail message payload."""
 
     if "parts" in payload:
 
+        # Prefer plain text.
         for part in payload["parts"]:
 
-            mime_type = part.get(
-                "mimeType",
-                ""
-            )
+            mime_type = part.get("mimeType", "")
 
-            # Prefer plain text
             if mime_type == "text/plain":
 
-                data = part.get(
-                    "body",
-                    {}
-                ).get(
-                    "data"
-                )
+                data = part.get("body", {}).get("data")
 
                 if data:
-
-                    decoded = base64.urlsafe_b64decode(
+                    return base64.urlsafe_b64decode(
                         data
-                    ).decode(
-                        "utf-8",
-                        errors="ignore"
-                    )
+                    ).decode("utf-8", errors="ignore")
 
-                    return decoded
+        # Use HTML if plain text is unavailable.
+        for part in payload["parts"]:
 
+            mime_type = part.get("mimeType", "")
 
-            # Handle HTML
-            elif mime_type == "text/html":
+            if mime_type == "text/html":
 
-                data = part.get(
-                    "body",
-                    {}
-                ).get(
-                    "data"
-                )
+                data = part.get("body", {}).get("data")
 
                 if data:
-
                     decoded = base64.urlsafe_b64decode(
                         data
-                    ).decode(
-                        "utf-8",
-                        errors="ignore"
-                    )
+                    ).decode("utf-8", errors="ignore")
 
                     return clean_html(decoded)
 
+        # Handle nested multipart sections.
+        for part in payload["parts"]:
 
-            # Recursively handle nested multipart sections
-            elif "parts" in part:
+            if "parts" in part:
 
-                result = extract_email_body(
-                    part
-                )
+                result = extract_email_body(part)
 
                 if result:
                     return result
 
-
-    # -----------------------------------------------------
-    # Single-part email
-    # -----------------------------------------------------
-
-    body_data = payload.get(
-        "body",
-        {}
-    ).get(
-        "data"
-    )
+    # Handle single-part messages.
+    body_data = payload.get("body", {}).get("data")
 
     if body_data:
 
         decoded = base64.urlsafe_b64decode(
             body_data
-        ).decode(
-            "utf-8",
-            errors="ignore"
-        )
+        ).decode("utf-8", errors="ignore")
 
         if payload.get("mimeType") == "text/html":
-
             return clean_html(decoded)
 
         return decoded
-
 
     return ""
 
 
 # =========================================================
-# GET UNREAD EMAILS
+# EXTRACT EMAIL HEADERS
+# =========================================================
+
+def extract_email_headers(headers):
+    """Extract From, Reply-To and Subject separately."""
+
+    sender = ""
+    reply_to = ""
+    subject = ""
+
+    for header in headers:
+
+        header_name = header.get("name", "").lower()
+        header_value = header.get("value", "")
+
+        if header_name == "from":
+            sender = header_value
+
+        elif header_name == "reply-to":
+            reply_to = header_value
+
+        elif header_name == "subject":
+            subject = header_value
+
+    return {
+        "sender": sender,
+        "reply_to": reply_to,
+        "subject": subject
+    }
+
+
+# =========================================================
+# GET UNREAD EMAILS - READ ONLY
 # =========================================================
 
 def get_unread_emails():
     """
-    Retrieve unread emails from the Gmail inbox.
+    Retrieve unread inbox emails.
+
+    This function only reads messages.
+    It does not mark messages as read or send emails.
     """
 
-    service = get_gmail_service()
+    service = get_agent_gmail_service()
 
     results = (
         service.users()
         .messages()
         .list(
             userId="me",
-            labelIds=[
-                "INBOX",
-                "UNREAD"
-            ],
+            labelIds=["INBOX", "UNREAD"],
             maxResults=10
         )
         .execute()
     )
 
-    messages = results.get(
-        "messages",
-        []
-    )
-
+    messages = results.get("messages", [])
 
     if not messages:
         return []
 
-
     emails = []
-
-
-    # -----------------------------------------------------
-    # Retrieve complete information for every email
-    # -----------------------------------------------------
 
     for message_info in messages:
 
@@ -266,111 +164,20 @@ def get_unread_emails():
             .execute()
         )
 
+        payload = message.get("payload", {})
 
-        headers = message[
-            "payload"
-        ].get(
-            "headers",
-            []
-        )
+        headers = payload.get("headers", [])
 
+        email_headers = extract_email_headers(headers)
 
-        sender = ""
-        subject = ""
+        body = extract_email_body(payload)
 
-
-        # -------------------------------------------------
-        # Extract headers
-        # -------------------------------------------------
-
-        for header in headers:
-
-            header_name = header[
-                "name"
-            ].lower()
-
-
-            if header_name == "from":
-
-                sender = header[
-                    "value"
-                ]
-
-
-            elif header_name == "subject":
-
-                subject = header[
-                    "value"
-                ]
-
-
-        # -------------------------------------------------
-        # Extract body
-        # -------------------------------------------------
-
-        body = extract_email_body(
-            message["payload"]
-        )
-
-
-        # -------------------------------------------------
-        # Store email
-        # -------------------------------------------------
-
-        emails.append(
-            {
-                "id": message["id"],
-                "sender": sender,
-                "subject": subject,
-                "body": body
-            }
-        )
-
+        emails.append({
+            "id": message["id"],
+            "sender": email_headers["sender"],
+            "reply_to": email_headers["reply_to"],
+            "subject": email_headers["subject"],
+            "body": body
+        })
 
     return emails
-
-
-# =========================================================
-# MARK EMAIL AS READ
-# =========================================================
-
-def mark_email_as_read(message_id):
-    """
-    Mark a Gmail message as read by removing
-    the UNREAD label.
-
-    If Gmail is temporarily unreachable,
-    do not crash the entire application.
-    """
-
-    try:
-
-        service = get_gmail_service()
-
-
-        service.users().messages().modify(
-            userId="me",
-            id=message_id,
-            body={
-                "removeLabelIds": [
-                    "UNREAD"
-                ]
-            }
-        ).execute()
-
-
-        return True
-
-
-    except Exception as e:
-
-        print(
-            "\nCould not mark email as read."
-        )
-
-        print(
-            "Gmail API error:",
-            e
-        )
-
-        return False

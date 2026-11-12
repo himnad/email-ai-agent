@@ -25,3 +25,13 @@ gmail_token.pickle
 # OS
 .DS_Store
 Thumbs.db
+
+# SafeMail security data
+safemail/*.db
+safemail/*.sqlite
+safemail/*.sqlite3
+
+# Local backups
+*.bak
+secrets/
+*.sqlite3

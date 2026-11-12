@@ -1,8 +1,7 @@
 from email.message import EmailMessage
 import base64
 
-from gmail.gmail_service import get_gmail_service
-
+from gmail.safemail_gmail_service import get_safemail_gmail_service
 
 def send_email(to: str, subject: str, body: str):
     """
@@ -10,7 +9,7 @@ def send_email(to: str, subject: str, body: str):
     """
 
     # Get authenticated Gmail service
-    service = get_gmail_service()
+    service = get_safemail_gmail_service()
 
     # Create the email
     message = EmailMessage()
